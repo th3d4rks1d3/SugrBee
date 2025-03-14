@@ -1,0 +1,1745 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <time.h>
+#include <SPIFFS.h>
+#include <FS.h>
+#include <WiFiClientSecure.h> // For HTTPS connections (without validation)
+#include <PNGdec.h>  // Include PNG decoder library
+#include <XPT2046_Touchscreen.h> // Include touch screen library
+#include <SPI.h>
+
+// TFT Display setup
+TFT_eSPI tft = TFT_eSPI();
+
+// PNG decoder instance
+PNG png;
+
+// Buffer for PNG decoding - sized to handle the pixel data
+#define MAX_IMAGE_WBYTES 240 // Set this to the maximum width of your arrow PNGs
+#define PNG_BUFFER_SIZE 6000 // Value that works for most small PNG images like arrows
+uint8_t pngBuffer[PNG_BUFFER_SIZE]; // Decoder buffer
+
+// PNG file names for different trend arrows
+const char* TREND_PNG_FILES[] = {
+    "/none.png",             // 0 - None (no arrow)
+    "/doubleup.png",         // 1 - DoubleUp
+    "/up.png",               // 2 - SingleUp
+    "/diagonalup.png",       // 3 - FortyFiveUp
+    "/even.png",             // 4 - Flat
+    "/diagonaldown.png",     // 5 - FortyFiveDown
+    "/down.png",             // 6 - SingleDown
+    "/doubledown.png",       // 7 - DoubleDown
+    "/question.png",         // 8 - NotComputable
+    "/dash.png"              // 9 - RateOutOfRange
+};
+
+// Touchscreen pins - adjust based on your wiring
+#define XPT2046_IRQ 36   // T_IRQ
+#define XPT2046_MOSI 32  // T_DIN
+#define XPT2046_MISO 39  // T_OUT
+#define XPT2046_CLK 25   // T_CLK
+#define XPT2046_CS 33    // T_CS
+
+// Create a dedicated SPI bus for the touchscreen
+SPIClass touchscreenSPI = SPIClass(VSPI);
+XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
+bool touchEnabled = false; // Flag to track if touch is initialized successfully
+
+// Settings structure
+struct Settings {
+  char dexcomUsername[50] = "";
+  char dexcomPassword[50] = "";
+  bool useEUServer = false;
+};
+
+Settings settings;
+
+// Dexcom API URLs (will be set based on EU/US selection)
+String dexcomAuthenticateUrl;
+String dexcomLoginUrl;
+String dexcomGlucoseUrl;
+
+// US Dexcom servers - Updated to match working code
+const char* US_AUTHENTICATE_URL = "https://share2.dexcom.com/ShareWebServices/Services/General/AuthenticatePublisherAccount";
+const char* US_LOGIN_URL = "https://share2.dexcom.com/ShareWebServices/Services/General/LoginPublisherAccountById";
+const char* US_GLUCOSE_URL = "https://share2.dexcom.com/ShareWebServices/Services/Publisher/ReadPublisherLatestGlucoseValues";
+
+// EU Dexcom servers
+const char* EU_AUTHENTICATE_URL = "https://shareous1.dexcom.com/ShareWebServices/Services/General/AuthenticatePublisherAccount";
+const char* EU_LOGIN_URL = "https://shareous1.dexcom.com/ShareWebServices/Services/General/LoginPublisherAccountById";
+const char* EU_GLUCOSE_URL = "https://shareous1.dexcom.com/ShareWebServices/Services/Publisher/ReadPublisherLatestGlucoseValues";
+
+// Updated application ID
+const char* applicationId = "d89443d2-327c-4a6f-89e5-496bbb0317db"; // Updated ID
+
+// Alternative application IDs (uncomment to try if the first one doesn't work)
+// const char* applicationId = "d8665ade-9673-4e27-9ff6-92db4ce13d13"; // Original ID
+// const char* applicationId = "e4231b73-28e2-4603-a658-11233aa23df1"; // From Nightscout
+// const char* applicationId = "f7082951-ebc4-4423-a94e-6a01f4ffc911"; // Common alternative from GitHub
+
+char accountId[100] = ""; // Changed from String to char array
+char sessionId[100] = ""; // Changed from String to char array
+unsigned long lastUpdateTime = 0;
+unsigned long lastDexcomReadingTime = 0; // Timestamp from Dexcom's last reading
+unsigned long lastGlucoseValue = 0; // Last glucose value to detect changes
+const unsigned long updateInterval = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+// Glucose data
+float current_glucose_mgdl = 0;
+float previous_glucose_mgdl = 0;
+float glucose_diff = 0;
+float glucose_mmol = 0;
+char trend[20] = "Flat"; // Changed from String to char array
+char timestamp[10] = "N/A"; // Changed from String to char array
+
+// Track display mode (true = mg/dL, false = mmol/L)
+bool displayMgDL = true;
+
+// Track touch area
+int glucoseTouchX = 0;
+int glucoseTouchY = 0;
+int glucoseTouchWidth = 0;
+int glucoseTouchHeight = 0;
+unsigned long lastTouchTime = 0;  // To prevent multiple toggles from a single touch
+const unsigned long touchDebounce = 500; // 500ms debounce period
+
+// New variables to track display state and reduce flickering
+bool displayNeedsFullUpdate = true;     // Flag for full display refresh
+bool displayNeedsTimeUpdate = true;     // Flag for time display refresh
+char lastDisplayedTimeStr[30] = "";     // Track last displayed time string
+float lastDisplayedGlucose = -1;        // Track last displayed glucose 
+char lastDisplayedTrend[20] = "";       // Track last displayed trend
+bool lastDisplayedMgDL = true;          // Track last displayed units
+
+// Trend direction mapping
+const char *DEXCOM_TREND_DIRECTIONS[] = {
+    "None",          // 0 - Unconfirmed
+    "DoubleUp",      // 1 - Rapidly rising
+    "SingleUp",      // 2 - Rising
+    "FortyFiveUp",   // 3 - Slowly rising
+    "Flat",          // 4 - Stable
+    "FortyFiveDown", // 5 - Slowly falling
+    "SingleDown",    // 6 - Falling
+    "DoubleDown",    // 7 - Rapidly falling
+    "NotComputable", // 8 - Unconfirmed
+    "RateOutOfRange" // 9 - Unconfirmed
+};
+
+// Define colors for different BG ranges
+#define COLOR_BG_LOW TFT_BLUE
+#define COLOR_BG_NORMAL TFT_GREEN
+#define COLOR_BG_HIGH TFT_YELLOW
+#define COLOR_BG_VERY_HIGH TFT_RED
+
+// Reset button pin (for resetting WiFi settings)
+const int RESET_PIN = 0; // GPIO0 is often a button on ESP32 boards
+
+// Flag for settings reset
+bool shouldResetSettings = false;
+
+// Function declarations
+void saveSettings();
+void loadSettings();
+bool initSPIFFS();
+void displayInitialScreen();
+void configModeCallback(WiFiManager *myWiFiManager);
+bool authenticateToDexcom();
+bool authenticateWithRetry();
+bool loginToDexcom();
+void fetchGlucoseData(bool isOverdueCheck = false);
+time_t extractUnixTime(const char* rawTime);
+bool formatTimestamp(const char* rawTime, char* formattedTime, size_t maxSize);
+void updateTimeDisplay();
+void updateDisplay();
+bool checkTimeForUpdate(unsigned long currentTime, unsigned long lastUpdate, unsigned long interval);
+void drawTrendIndicator(int x, int y, const char* trend, uint16_t color);
+bool checkDiff(DynamicJsonDocument &doc);
+void checkWiFiConnection();
+void setupTime();
+
+// Our custom drawing structure for passing coordinates 
+struct PNG_DRAW_PARAMS {
+  int16_t x;      // X offset on screen
+  int16_t y;      // Y offset on screen
+  uint16_t color; // For color tinting if needed
+};
+
+// PNG drawing callback function
+void PNGDraw(PNGDRAW *pDraw) {
+  // Create a buffer for a single line of image
+  uint16_t lineBuffer[MAX_IMAGE_WBYTES];
+  
+  // Get the pointer to our custom parameters passed through decode()
+  PNG_DRAW_PARAMS *params = (PNG_DRAW_PARAMS*)pDraw->pUser;
+  
+  // Convert the native PNG format to RGB565 that TFT can use
+  // 0xffffffff sets no background color for transparency
+  png.getLineAsRGB565(pDraw, lineBuffer, PNG_RGB565_BIG_ENDIAN, 0xffffffff);
+  
+  // Calculate the position where to display this line
+  int16_t x = params->x;
+  int16_t y = params->y + pDraw->y; // Current line position
+  
+  // Push the line to the display
+  tft.pushImage(x, y, pDraw->iWidth, 1, lineBuffer);
+}
+
+// Function to load and draw a PNG from SPIFFS at a given position
+bool drawPNG(const char* filename, int16_t x, int16_t y) {
+  Serial.printf("Loading PNG: %s\n", filename);
+  
+  // Open the file
+  File pngFile = SPIFFS.open(filename, "r");
+  if (!pngFile) {
+    Serial.printf("Error: Could not open %s file\n", filename);
+    return false;
+  }
+  
+  // Get the file size
+  size_t fileSize = pngFile.size();
+  
+  if (fileSize == 0) {
+    Serial.println("File is empty");
+    pngFile.close();
+    return false;
+  }
+  
+  Serial.printf("PNG file size: %d bytes\n", fileSize);
+  
+  // Read the file into a buffer
+  uint8_t *buffer = (uint8_t*)malloc(fileSize);
+  if (!buffer) {
+    Serial.println("Failed to allocate memory for PNG file");
+    pngFile.close();
+    return false;
+  }
+  
+  size_t bytesRead = pngFile.read(buffer, fileSize);
+  pngFile.close();
+  
+  if (bytesRead != fileSize) {
+    Serial.println("Failed to read complete PNG file");
+    free(buffer);
+    return false;
+  }
+  
+  // Set up our PNG decoder with the buffer we just created
+  int16_t rc = png.openRAM(buffer, fileSize, PNGDraw);
+  
+  if (rc != PNG_SUCCESS) {
+    Serial.printf("PNG header decode error: %d\n", rc);
+    free(buffer);
+    return false;
+  }
+  
+  // Get PNG dimensions
+  int16_t pngWidth = png.getWidth();
+  int16_t pngHeight = png.getHeight();
+  
+  Serial.printf("PNG image specs: width: %d, height: %d, depth: %d\n", 
+                pngWidth, pngHeight, png.getBpp());
+  
+  // Set up our custom parameters to pass to the draw function
+  PNG_DRAW_PARAMS params;
+  params.x = x - (pngWidth / 2);  // Center the image horizontally
+  params.y = y - (pngHeight / 2); // Center the image vertically
+  params.color = TFT_WHITE;       // Not used anymore but keeping for compatibility
+  
+  // Decode and render the PNG with our custom parameters
+  rc = png.decode(&params, PNG_FAST_PALETTE);
+  
+  // Free the buffer
+  free(buffer);
+  
+  // Close the PNG decoder
+  png.close();
+  
+  if (rc != PNG_SUCCESS) {
+    Serial.printf("PNG decode error: %d\n", rc);
+    return false;
+  }
+  
+  Serial.println("PNG successfully rendered");
+  return true;
+}
+
+void drawTrendIndicator(int x, int y, const char* trend, uint16_t color) {
+  // Find matching trend direction
+  int trendIndex = 0; // Default to "None"
+  for (int i = 0; i < 10; i++) {
+    if (strcmp(trend, DEXCOM_TREND_DIRECTIONS[i]) == 0) {
+      trendIndex = i;
+      break;
+    }
+  }
+  
+  // Special case for None (index 0) - don't draw anything
+  if (trendIndex == 0) {
+    return;
+  }
+  
+  // Check if the PNG file exists in SPIFFS before trying to draw
+  if (SPIFFS.exists(TREND_PNG_FILES[trendIndex])) {
+    // Draw the PNG for the appropriate trend
+    Serial.printf("Attempting to draw trend PNG: %s for trend: %s\n", TREND_PNG_FILES[trendIndex], trend);
+    if (drawPNG(TREND_PNG_FILES[trendIndex], x, y)) {
+      Serial.println("Successfully drew trend PNG");
+      return; // Success! No need for fallback
+    } else {
+      Serial.println("Failed to draw PNG, falling back to text");
+    }
+  } else {
+    Serial.printf("PNG file not found: %s\n", TREND_PNG_FILES[trendIndex]);
+  }
+  
+  // Fall back to text if PNG fails or doesn't exist
+  tft.setTextSize(3);
+  tft.setTextColor(color); // Keep text fallback in the glucose color for better visibility
+  tft.setCursor(x - 15, y - 15);
+  
+  // Display a basic text fallback
+  switch (trendIndex) {
+    case 1: tft.print("^^"); break;  // DoubleUp
+    case 2: tft.print("^"); break;   // SingleUp
+    case 3: tft.print("/"); break;   // FortyFiveUp  
+    case 4: tft.print("->"); break;  // Flat
+    case 5: tft.print("\\"); break;  // FortyFiveDown
+    case 6: tft.print("v"); break;   // SingleDown
+    case 7: tft.print("vv"); break;  // DoubleDown
+    case 8: tft.print("?"); break;   // NotComputable
+    case 9: tft.print("-"); break;   // RateOutOfRange
+    default: break;                  // None - draw nothing
+  }
+}
+
+void setupTime() {
+  // Configure time (needed for HTTPS)
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  Serial.println("Waiting for NTP time sync...");
+  
+  // Wait up to 10 seconds for time to be set
+  int retryCount = 0;
+  time_t now = time(nullptr);
+  while (now < 24 * 3600 && retryCount < 20) {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+    retryCount++;
+  }
+  
+  if (now < 24 * 3600) {
+    Serial.println("\nNTP sync failed! Using defaults.");
+  } else {
+    struct tm timeInfo;
+    gmtime_r(&now, &timeInfo);
+    char timeStr[30];
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeInfo);
+    Serial.print("\nNTP time synced: ");
+    Serial.println(timeStr);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\nDexcom Monitor Starting...");
+  Serial.print("Free heap at start: ");
+  Serial.println(ESP.getFreeHeap());
+  
+  // Initialize display
+  tft.init();
+  tft.setRotation(1); // Landscape mode
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  
+  // Initialize touch screen with dedicated SPI bus
+  touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  if (touchscreen.begin(touchscreenSPI)) {
+    Serial.println("Touch screen initialized");
+    touchEnabled = true;
+    // Set touchscreen rotation to match TFT rotation
+    touchscreen.setRotation(tft.getRotation());
+  } else {
+    Serial.println("Touch screen initialization failed");
+  }
+  
+  // Show startup message
+  displayInitialScreen();
+  
+  // Initialize SPIFFS for storing settings - allow formatting if mounting fails
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed - Formatting");
+    if (!SPIFFS.format()) {
+      Serial.println("SPIFFS format failed");
+    } else {
+      Serial.println("SPIFFS formatted successfully");
+      if (!SPIFFS.begin()) {
+        Serial.println("SPIFFS mount still failed after format");
+      } else {
+        Serial.println("SPIFFS mounted after format");
+      }
+    }
+  } else {
+    Serial.println("SPIFFS mounted successfully");
+  }
+  
+  // Load saved settings
+  loadSettings();
+  
+  // Add this debug output to check if credentials are loaded
+  Serial.println("Checking loaded credentials:");
+  Serial.print("Username length: ");
+  Serial.println(strlen(settings.dexcomUsername));
+  Serial.print("Password length: ");
+  Serial.println(strlen(settings.dexcomPassword));
+  Serial.print("EU Server: ");
+  Serial.println(settings.useEUServer ? "Yes" : "No");
+  
+  // Check if credentials are empty and display warning
+  if (strlen(settings.dexcomUsername) == 0 || strlen(settings.dexcomPassword) == 0) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_RED);
+    tft.setCursor(20, 60);
+    tft.println("Warning: Empty credentials");
+    tft.setCursor(20, 90);
+    tft.println("Please configure settings");
+    delay(3000);
+  }
+  
+  // Set the reset pin as input
+  pinMode(RESET_PIN, INPUT_PULLUP);
+  
+  // Check if reset button is pressed during boot
+  if (digitalRead(RESET_PIN) == LOW) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(20, 60);
+    tft.println("Reset button pressed");
+    tft.setCursor(20, 90);
+    tft.println("Resetting settings...");
+    shouldResetSettings = true;
+    delay(2000);
+  }
+  
+  // Initialize WiFiManager
+  WiFiManager wifiManager;
+  
+  // Set callback for entering configuration mode
+  wifiManager.setAPCallback(configModeCallback);
+  
+  // Add custom parameters for Dexcom credentials
+  WiFiManagerParameter custom_dexcom_username("dexcomUser", "Dexcom Username", settings.dexcomUsername, 50);
+  WiFiManagerParameter custom_dexcom_password("dexcomPass", "Dexcom Password", settings.dexcomPassword, 50);
+  
+  // Add checkbox for EU/US server selection
+  char customHtml[128];
+  snprintf(customHtml, sizeof(customHtml), 
+           "<br/><label for='euServer'>Use EU Dexcom Server</label><input type='checkbox' id='euServer' name='euServer' value='1' %s>", 
+           settings.useEUServer ? "checked" : "");
+  WiFiManagerParameter custom_eu_server("euServer", "EU Server", "0", 2, customHtml);
+  
+  wifiManager.addParameter(&custom_dexcom_username);
+  wifiManager.addParameter(&custom_dexcom_password);
+  wifiManager.addParameter(&custom_eu_server);
+  
+  // Reset settings if button was pressed
+  if (shouldResetSettings) {
+    wifiManager.resetSettings();
+  }
+  
+  // Set connection timeout
+  wifiManager.setConnectTimeout(30);
+  
+  // Connect to WiFi or start config portal
+  if (!wifiManager.autoConnect("Dexcom-Monitor-Setup")) {
+    Serial.println("Failed to connect and hit timeout");
+    tft.fillScreen(TFT_BLACK);
+    tft.setCursor(20, 60);
+    tft.println("Connection failed!");
+    tft.setCursor(20, 90);
+    tft.println("Restarting...");
+    delay(3000);
+    ESP.restart();
+  }
+  
+  // If we got here, we're connected to WiFi
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(20, 60);
+  tft.println("WiFi Connected!");
+  tft.setCursor(20, 90);
+  tft.println("IP: " + WiFi.localIP().toString());
+  
+  // Wait a bit after WiFi connects to ensure stability
+  Serial.println("WiFi connected, waiting 2 seconds to stabilize...");
+  delay(2000);
+  
+  // Save parameters from WiFiManager
+  strncpy(settings.dexcomUsername, custom_dexcom_username.getValue(), sizeof(settings.dexcomUsername) - 1);
+  settings.dexcomUsername[sizeof(settings.dexcomUsername) - 1] = '\0'; // Ensure null termination
+  
+  strncpy(settings.dexcomPassword, custom_dexcom_password.getValue(), sizeof(settings.dexcomPassword) - 1);
+  settings.dexcomPassword[sizeof(settings.dexcomPassword) - 1] = '\0'; // Ensure null termination
+  
+  settings.useEUServer = (strncmp(custom_eu_server.getValue(), "1", 1) == 0);
+  
+  // Save settings to SPIFFS
+  saveSettings();
+  
+  // Set Dexcom URLs based on server selection
+  if (settings.useEUServer) {
+    dexcomAuthenticateUrl = EU_AUTHENTICATE_URL;
+    dexcomLoginUrl = EU_LOGIN_URL;
+    dexcomGlucoseUrl = EU_GLUCOSE_URL;
+    Serial.println("Using EU Dexcom servers");
+  } else {
+    dexcomAuthenticateUrl = US_AUTHENTICATE_URL;
+    dexcomLoginUrl = US_LOGIN_URL;
+    dexcomGlucoseUrl = US_GLUCOSE_URL;
+    Serial.println("Using US Dexcom servers");
+  }
+  
+  // Configure time (needed for HTTPS)
+  tft.setCursor(20, 120);
+  tft.println("Setting up NTP...");
+  
+  // Use our improved setupTime function
+  setupTime();
+  
+  // List all files in SPIFFS to verify PNG arrows are present
+  Serial.println("\nFiles in SPIFFS:");
+  File root = SPIFFS.open("/");
+  File file = root.openNextFile();
+  while (file) {
+    String fileName = file.name();
+    Serial.println(fileName);
+    file = root.openNextFile();
+  }
+  
+  // Test PNG loading and display
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(20, 50);
+  tft.println("Testing PNG arrows...");
+  
+  // List all files in SPIFFS to verify PNG arrows are present
+  root = SPIFFS.open("/");
+  file = root.openNextFile();
+  int fileCount = 0;
+  
+  tft.setCursor(20, 80);
+  tft.println("Files in SPIFFS:");
+  
+  while (file && fileCount < 5) {
+    String fileName = file.name();
+    Serial.println(fileName);
+    
+    tft.setCursor(20, 110 + (fileCount * 20));
+    tft.println(fileName);
+    
+    file = root.openNextFile();
+    fileCount++;
+  }
+  
+  // Check for the "even.png" (flat arrow) file
+  if (SPIFFS.exists("/even.png")) {
+    if (drawPNG("/even.png", tft.width()/2, tft.height()/2)) {
+      tft.setCursor(20, tft.height() - 50);
+      tft.println("PNG test successful");
+    } else {
+      tft.setCursor(20, tft.height() - 50);
+      tft.println("PNG decode failed");
+    }
+  } else {
+    tft.setCursor(20, tft.height() - 50);
+    tft.println("PNG not found - upload files");
+    
+    // Show instructions on how to add PNGs
+    tft.setCursor(20, tft.height() - 30);
+    tft.println("Upload arrow PNGs to SPIFFS");
+  }
+  
+  delay(3000); // Display for 3 seconds
+  
+  // Verify credentials before connecting to Dexcom
+  if (strlen(settings.dexcomUsername) == 0 || strlen(settings.dexcomPassword) == 0) {
+    Serial.println("ERROR: Dexcom credentials are empty!");
+    Serial.println("Skipping authentication until credentials are set");
+    
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_RED);
+    tft.setCursor(20, 60);
+    tft.println("Missing Dexcom credentials");
+    tft.setCursor(20, 90);
+    tft.println("Hold reset button for 5s");
+    tft.setCursor(20, 120);
+    tft.println("Then reconfigure settings");
+    
+    // Don't attempt to connect to Dexcom
+    return;
+  }
+  
+  // Connect to Dexcom
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(20, 60);
+  tft.println("Connecting to Dexcom...");
+  
+  // Use new retry function for better robustness
+  if (authenticateWithRetry()) {
+    if (loginToDexcom()) {
+      fetchGlucoseData();
+    }
+  }
+  
+  Serial.print("Free heap after setup: ");
+  Serial.println(ESP.getFreeHeap());
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Handle touch input if touch is enabled
+  if (touchEnabled) {
+    // Use both tirqTouched() and touched() for more reliable detection
+    if (touchscreen.tirqTouched() && touchscreen.touched() && currentTime - lastTouchTime > touchDebounce) {
+      TS_Point p = touchscreen.getPoint();
+      
+      // Convert touch coordinates to screen coordinates with proper calibration
+      // These calibration values (200-3700, 240-3800) may need adjustment for your specific screen
+      int touchX = map(p.x, 200, 3700, 0, tft.width());
+      int touchY = map(p.y, 240, 3800, 0, tft.height());
+      int touchZ = p.z;  // Pressure
+      
+      Serial.print("Touch detected - X: ");
+      Serial.print(touchX);
+      Serial.print(", Y: ");
+      Serial.print(touchY);
+      Serial.print(", Z: ");
+      Serial.println(touchZ);
+      
+      // Check if touch is within glucose display area
+      if (touchX >= glucoseTouchX && touchX <= (glucoseTouchX + glucoseTouchWidth) &&
+          touchY >= glucoseTouchY && touchY <= (glucoseTouchY + glucoseTouchHeight)) {
+        // Toggle display mode
+        displayMgDL = !displayMgDL;
+        // Mark for update only if the display mode changed
+        if (lastDisplayedMgDL != displayMgDL) {
+          displayNeedsFullUpdate = true;
+          lastDisplayedMgDL = displayMgDL;
+        }
+        lastTouchTime = currentTime;
+      }
+      
+      // Wait a bit to avoid multiple reads from same touch
+      delay(50);
+    }
+  }
+  
+  // Check if reset button is being held for 5 seconds
+  if (digitalRead(RESET_PIN) == LOW) {
+    unsigned long buttonPressStart = currentTime;
+    while (digitalRead(RESET_PIN) == LOW && millis() - buttonPressStart < 5000) {
+      delay(100);
+    }
+    
+    // If button was held for 5 seconds
+    if (millis() - buttonPressStart >= 5000) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setCursor(20, 60);
+      tft.println("Resetting settings...");
+      tft.setCursor(20, 90);
+      tft.println("Restarting...");
+      
+      // Reset WiFi settings
+      WiFiManager wifiManager;
+      wifiManager.resetSettings();
+      
+      delay(2000);
+      ESP.restart();
+    }
+  }
+  
+  // Check WiFi connection every 5 minutes
+  static unsigned long lastWiFiCheckTime = 0;
+  if (currentTime - lastWiFiCheckTime >= 300000) { // 5 minutes
+    checkWiFiConnection();
+    lastWiFiCheckTime = currentTime;
+  }
+  
+  // For the data update, only check a few seconds before the expected Dexcom update
+  bool shouldUpdate = false;
+  bool isOverdueCheck = false; // Flag to indicate if this is a frequent overdue check
+  static unsigned long lastCheckTime = 0; // Track when we last checked (separate from lastUpdateTime)
+  
+  if (lastUpdateTime == 0) {
+    // First run - always update
+    shouldUpdate = true;
+    Serial.println("First run, fetching initial glucose data...");
+  } 
+  else if (lastDexcomReadingTime > 0) {
+    // We have a previous Dexcom reading timestamp
+    time_t now = time(nullptr);
+    unsigned long long currentEpochMillis = ((unsigned long long)now) * 1000;
+    
+    // Calculate time since last Dexcom reading in milliseconds
+    unsigned long long timeSinceLastReading = currentEpochMillis - lastDexcomReadingTime;
+    unsigned long secondsSinceLastReading = timeSinceLastReading / 1000;
+    
+    // Dexcom updates every 5 minutes (300 seconds)
+    // Only check if we're close to the 5-minute mark (between 295-305 seconds) 
+    // AND we haven't checked in the last 15 seconds
+    if ((secondsSinceLastReading >= 295 && secondsSinceLastReading <= 305) && 
+        (currentTime - lastCheckTime >= 15000 || lastCheckTime == 0)) {
+      shouldUpdate = true;
+      lastCheckTime = currentTime;
+      Serial.printf("Checking for update: Last reading was %lu seconds ago\n", secondsSinceLastReading);
+    }
+    
+    // Fallback: If it's been more than 6 minutes since the last reading,
+    // check every 10 seconds until we get a new reading
+    if (secondsSinceLastReading > 360 && (currentTime - lastCheckTime >= 10000 || lastCheckTime == 0)) {
+      shouldUpdate = true;
+      isOverdueCheck = true; // Mark this as an overdue check
+      lastCheckTime = currentTime;
+      Serial.printf("Backup check: Last reading was %lu seconds ago (overdue)\n", secondsSinceLastReading);
+    }
+  } 
+  else {
+    // If we don't have a Dexcom timestamp yet, check every 5 minutes
+    if (checkTimeForUpdate(currentTime, lastUpdateTime, updateInterval)) {
+      shouldUpdate = true;
+      lastCheckTime = currentTime;
+      Serial.println("Checking on regular interval (no Dexcom timestamp yet)");
+    }
+  }
+  
+  // Update if needed and we're connected to WiFi
+  if (shouldUpdate) {
+    if (WiFi.status() == WL_CONNECTED) {
+      // Only try to fetch glucose data if we have valid credentials
+      if (strlen(settings.dexcomUsername) > 0 && strlen(settings.dexcomPassword) > 0) {
+        // Try to fetch glucose data if we have a session ID
+        if (strlen(sessionId) > 0) {
+          Serial.println("Fetching glucose data...");
+          fetchGlucoseData(isOverdueCheck); // Pass the flag to indicate if this is an overdue check
+        } else if (authenticateWithRetry()) {  // Use the new retry function here too
+          // If no session ID, try to authenticate and login
+          if (loginToDexcom()) {
+            Serial.println("Authentication successful, fetching glucose data...");
+            fetchGlucoseData(isOverdueCheck);
+          }
+        }
+      } else {
+        Serial.println("Missing Dexcom credentials, cannot update");
+      }
+    } else {
+      // WiFi is disconnected - try to reconnect via the check function
+      checkWiFiConnection();
+    }
+  }
+  
+  // Update the time display less frequently - only every minute
+  static unsigned long lastTimeDisplayUpdate = 0;
+  if (currentTime - lastTimeDisplayUpdate >= 60000) { // Every minute (60 seconds)
+    lastTimeDisplayUpdate = currentTime;
+    displayNeedsTimeUpdate = true;
+  }
+  
+  // Apply all pending display updates at the end of the loop
+  if (displayNeedsFullUpdate) {
+    updateDisplay();
+    displayNeedsFullUpdate = false;
+    displayNeedsTimeUpdate = false; // Full update includes time
+  } else if (displayNeedsTimeUpdate) {
+    updateTimeDisplay();
+    displayNeedsTimeUpdate = false;
+  }
+  
+  delay(100); // Small delay to prevent CPU hogging
+}
+
+// Handle millis() rollover safely
+bool checkTimeForUpdate(unsigned long currentTime, unsigned long lastUpdate, unsigned long interval) {
+  // Check if millis() has rolled over
+  if (currentTime < lastUpdate) {
+    // Calculate time elapsed considering the rollover
+    return ((0xFFFFFFFF - lastUpdate) + currentTime) >= interval;
+  } else {
+    // Normal case, no rollover
+    return (currentTime - lastUpdate) >= interval;
+  }
+}
+
+// UPDATED AUTHENTICATION FUNCTION WITH IMPROVED ERROR HANDLING
+bool authenticateToDexcom() {
+  if (WiFi.status() == WL_CONNECTED) {
+    // Make sure we have valid credentials before attempting to authenticate
+    if (strlen(settings.dexcomUsername) == 0 || strlen(settings.dexcomPassword) == 0) {
+      Serial.println("Error: Dexcom credentials are empty!");
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextSize(2);
+      tft.setTextColor(TFT_RED);
+      tft.setCursor(20, 60);
+      tft.println("Missing Dexcom credentials");
+      tft.setCursor(20, 90);
+      tft.println("Reset & reconfigure");
+      return false;
+    }
+    
+    WiFiClientSecure client;
+    HTTPClient http;
+    Serial.println("Authenticating to Dexcom (step 1)...");
+    
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(20, 60);
+    tft.println("Connecting to Dexcom...");
+    
+    // Disable certificate validation
+    client.setInsecure();
+    
+    // Begin with secure client
+    if (!http.begin(client, dexcomAuthenticateUrl.c_str())) {
+      Serial.println("Failed to set up HTTPS connection");
+      return false;
+    }
+    
+    // Add headers that mimic a browser
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("User-Agent", "Dexcom Share/3.0.2.11 CFNetwork/711.2.23 Darwin/14.0.0");
+    http.addHeader("Accept", "application/json");
+    http.setTimeout(15000); // Increased timeout to 15 seconds
+    
+    // Create authentication JSON using buffer 
+    char authenticatePayload[256];
+    snprintf(authenticatePayload, sizeof(authenticatePayload), 
+             "{\"accountName\":\"%s\",\"password\":\"%s\",\"applicationId\":\"%s\"}", 
+             settings.dexcomUsername, settings.dexcomPassword, applicationId);
+    
+    Serial.println("Sending authentication request...");
+    Serial.print("Username length: ");
+    Serial.println(strlen(settings.dexcomUsername));
+    Serial.print("Password length: ");
+    Serial.println(strlen(settings.dexcomPassword));
+    
+    int httpResponseCode = http.POST(authenticatePayload);
+    String response = http.getString(); // Get response before closing connection
+    
+    if (httpResponseCode == HTTP_CODE_OK) {
+      // Remove quotes from account ID and copy to char array
+      response.replace("\"", "");
+      strncpy(accountId, response.c_str(), sizeof(accountId) - 1);
+      accountId[sizeof(accountId) - 1] = '\0'; // Ensure null termination
+      
+      Serial.print("Account ID: ");
+      Serial.println(accountId);
+      
+      http.end();
+      return true;
+    } else {
+      Serial.print("Error on authentication: ");
+      Serial.println(httpResponseCode);
+      Serial.print("Error message: ");
+      Serial.println(http.errorToString(httpResponseCode));
+      Serial.print("Response: ");
+      Serial.println(response);
+      
+      // Display detailed error on screen
+      tft.fillScreen(TFT_BLACK);
+      tft.setCursor(20, 30);
+      tft.println("Auth Error: " + String(httpResponseCode));
+      
+      tft.setTextSize(1);
+      tft.setCursor(20, 60);
+      tft.println("Response: " + response.substring(0, 120));
+      
+      tft.setCursor(20, 80);
+      if (httpResponseCode == 500) {
+        tft.println("Server error. Could be:");
+        tft.setCursor(20, 90);
+        tft.println("- Incorrect application ID");
+        tft.setCursor(20, 100);
+        tft.println("- Account/password issue");
+        tft.setCursor(20, 110);
+        tft.println("- Dexcom server problem");
+        tft.setCursor(20, 120);
+        tft.println("Try editing code with a different");
+        tft.setCursor(20, 130);
+        tft.println("application ID from the comments");
+      } else if (httpResponseCode == -1) {
+        tft.println("Connection failed");
+        tft.setCursor(20, 90);
+        tft.println("Check credentials & internet");
+      } else {
+        tft.println(http.errorToString(httpResponseCode));
+      }
+      
+      accountId[0] = '\0'; // Reset account ID on failure
+      http.end();
+      
+      // Add delay to prevent rapid retries that might cause IP blocking
+      delay(5000);
+      return false;
+    }
+  }
+  return false;
+}
+
+// NEW AUTHENTICATION RETRY FUNCTION
+bool authenticateWithRetry() {
+  // If you want to automatically try different application IDs,
+  // move the alternative IDs from comments into an array and loop through them
+  
+  // For now, try the current ID with improved error handling
+  for (int attempt = 0; attempt < 3; attempt++) {
+    Serial.print("Authentication attempt #");
+    Serial.println(attempt + 1);
+    
+    if (authenticateToDexcom()) {
+      return true;
+    }
+    
+    Serial.println("Authentication failed, retrying...");
+    delay(5000 * (attempt + 1)); // Exponential backoff
+  }
+  
+  return false;
+}
+
+bool loginToDexcom() {
+  if (WiFi.status() == WL_CONNECTED && strlen(accountId) > 0) {
+    WiFiClientSecure client;
+    HTTPClient http;
+    Serial.println("Logging in to Dexcom (step 2)...");
+    
+    // Disable certificate validation
+    client.setInsecure();
+    
+    // Begin with secure client
+    if (!http.begin(client, dexcomLoginUrl.c_str())) {
+      Serial.println("Failed to set up HTTPS connection");
+      return false;
+    }
+    
+    http.addHeader("Content-Type", "application/json");
+    // Add the same browser-like headers for consistency
+    http.addHeader("User-Agent", "Dexcom Share/3.0.2.11 CFNetwork/711.2.23 Darwin/14.0.0");
+    http.addHeader("Accept", "application/json");
+    http.setTimeout(15000); // Increased timeout to 15 seconds
+    
+    // Create login JSON using buffer instead of String concatenation
+    char loginPayload[256]; // Increase buffer size for safety
+    snprintf(loginPayload, sizeof(loginPayload), 
+             "{\"accountId\":\"%s\",\"password\":\"%s\",\"applicationId\":\"%s\"}", 
+             accountId, settings.dexcomPassword, applicationId);
+    
+    Serial.println("Sending login request...");
+    
+    int httpResponseCode = http.POST(loginPayload);
+    String response = http.getString(); // Get response before closing connection
+    
+    if (httpResponseCode == HTTP_CODE_OK) {
+      // Remove quotes from session ID and copy to char array
+      response.replace("\"", "");
+      strncpy(sessionId, response.c_str(), sizeof(sessionId) - 1);
+      sessionId[sizeof(sessionId) - 1] = '\0'; // Ensure null termination
+      
+      Serial.print("Session ID: ");
+      Serial.println(sessionId);
+      
+      tft.setCursor(20, 90);
+      tft.println("Login successful!");
+      
+      http.end();
+      return true;
+    } else {
+      Serial.print("Error on login: ");
+      Serial.println(httpResponseCode);
+      Serial.print("Error message: ");
+      Serial.println(http.errorToString(httpResponseCode));
+      Serial.print("Response: ");
+      Serial.println(response);
+      
+      // Display error on screen
+      tft.fillScreen(TFT_BLACK);
+      tft.setCursor(20, 60);
+      tft.println("Login Error: " + String(httpResponseCode));
+      tft.setCursor(20, 90);
+      tft.setTextSize(1);
+      tft.println("Response: " + response.substring(0, 60));
+      
+      sessionId[0] = '\0'; // Reset session ID on failure
+      http.end();
+      return false;
+    }
+  }
+  return false;
+}
+
+// Function to check if timestamps between readings are close enough to use for diff calculation
+bool checkDiff(DynamicJsonDocument &doc) {
+    if (doc.size() < 3)
+        return false;
+
+    // Extract timestamps from the readings
+    time_t time0 = extractUnixTime(doc[0]["DT"].as<const char*>());
+    time_t time1 = extractUnixTime(doc[1]["DT"].as<const char*>());
+    
+    // Log the times for debugging
+    Serial.println("Time 0: " + String(time0));
+    Serial.println("Time 1: " + String(time1));
+    Serial.println("Time diff < 300? " + String(abs(time0 - time1) < 300));
+
+    // Return true if the readings are within 5 minutes (300 seconds) of each other
+    return abs(time0 - time1) < 300;
+}
+
+// Extract Unix timestamp from Dexcom format
+time_t extractUnixTime(const char* rawTime) {
+    String rawTimeStr(rawTime);
+    if (rawTimeStr.startsWith("Date(")) {
+        int startPos = 5;
+        int dashPos = rawTimeStr.indexOf('-', startPos);
+        if (dashPos == -1)
+            dashPos = rawTimeStr.indexOf('+', startPos);
+
+        if (dashPos > startPos) {
+            String timestampStr = rawTimeStr.substring(startPos, dashPos);
+            return strtoull(timestampStr.c_str(), NULL, 10) / 1000;
+        }
+    }
+    return 0;
+}
+
+void fetchGlucoseData(bool isOverdueCheck) {
+  if (WiFi.status() == WL_CONNECTED && strlen(sessionId) > 0) {
+    WiFiClientSecure client;
+    HTTPClient http;
+    
+    // Only show the "Getting glucose data..." message for regular checks, not for overdue checks
+    if (!isOverdueCheck) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextSize(2);
+      tft.setCursor(20, 60);
+      tft.println("Getting glucose data...");
+    }
+    
+    // Disable certificate validation
+    client.setInsecure();
+    
+    // Begin with secure client
+    if (!http.begin(client, dexcomGlucoseUrl.c_str())) {
+      Serial.println("Failed to set up HTTPS connection");
+      return;
+    }
+    
+    // Add the same browser-like headers for consistency
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("User-Agent", "Dexcom Share/3.0.2.11 CFNetwork/711.2.23 Darwin/14.0.0");
+    http.addHeader("Accept", "application/json");
+    http.setTimeout(15000); // Increased timeout to 15 seconds
+    
+    // Create payload for glucose data using buffer instead of String concatenation
+    char fetchPayload[128]; // Increase buffer size for safety
+    snprintf(fetchPayload, sizeof(fetchPayload), 
+             "{\"sessionId\":\"%s\",\"minutes\":1440,\"maxCount\":4}", 
+             sessionId);
+    
+    Serial.println("Getting glucose data...");
+    
+    unsigned long requestStartTime = millis();
+    int httpResponseCode = http.POST(fetchPayload);
+    unsigned long requestEndTime = millis();
+    unsigned long requestDuration = requestEndTime - requestStartTime;
+    
+    Serial.print("Request took: ");
+    Serial.print(requestDuration);
+    Serial.println(" ms");
+    
+    if (httpResponseCode == HTTP_CODE_OK) {
+      String response = http.getString();
+      Serial.println("Response received");
+      
+      // Check for "SessionNotValid" in response
+      if (response.indexOf("SessionNotValid") != -1) {
+        Serial.println("Session expired! Re-authenticating...");
+        
+        // Reset session & account IDs
+        sessionId[0] = '\0';
+        accountId[0] = '\0';
+        
+        // Only show the "Session expired" message for regular checks
+        if (!isOverdueCheck) {
+          tft.fillScreen(TFT_BLACK);
+          tft.setCursor(20, 60);
+          tft.println("Session expired, retrying...");
+        }
+        
+        // Try to re-authenticate and login
+        if (authenticateWithRetry()) {  // Use retry function here too
+          if (loginToDexcom()) {
+            Serial.println("Re-login successful. Retrying glucose data fetch...");
+            fetchGlucoseData(isOverdueCheck); // Retry after successful login
+          } else {
+            Serial.println("Re-login failed!");
+          }
+        }
+        http.end();
+        return; // Stop execution here
+      }
+      
+      // Parse JSON response - increased buffer size for safety
+      DynamicJsonDocument doc(4096); // Increased from 2048 to 4096
+      DeserializationError error = deserializeJson(doc, response);
+      
+      if (!error) {
+        if (doc.size() >= 3) { // Ensure we have at least 3 readings
+          // Save current glucose to detect changes
+          unsigned long newGlucoseValue = doc[0]["Value"];
+          
+          // Check if this is actually a new reading
+          bool isNewReading = (newGlucoseValue != lastGlucoseValue) || (lastGlucoseValue == 0);
+          
+          // Determine which previous reading to use for comparison
+          int diffIndex = checkDiff(doc) ? 2 : 1; // Use reading from two steps back if times are close
+          
+          // Record previous and current values
+          previous_glucose_mgdl = doc[diffIndex]["Value"]; // Older reading
+          current_glucose_mgdl = newGlucoseValue;  // Latest reading
+          lastGlucoseValue = newGlucoseValue;      // Remember current value
+          glucose_mmol = current_glucose_mgdl / 18.0;
+          
+          // Copy trend to char array safely
+          const char* trendValue = doc[0]["Trend"].as<const char*>();
+          strncpy(trend, trendValue, sizeof(trend) - 1);
+          trend[sizeof(trend) - 1] = '\0'; // Ensure null termination
+          
+          // Extract the timestamp from Dexcom - this is when the reading was taken
+          String rawTime = doc[0]["DT"].as<String>(); // Example: "Date(1741497044189-0500)"
+          Serial.print("Raw timestamp from Dexcom: ");
+          Serial.println(rawTime);
+          
+          // Save old timestamp to detect changes
+          unsigned long long oldDexcomReadingTime = lastDexcomReadingTime;
+          
+          // Format the timestamp from Dexcom and save it
+          char formattedTime[10]; // Increased buffer size
+          if (formatTimestamp(rawTime.c_str(), formattedTime, sizeof(formattedTime))) {
+            strncpy(timestamp, formattedTime, sizeof(timestamp) - 1);
+            timestamp[sizeof(timestamp) - 1] = '\0'; // Ensure null termination
+            
+            // Check if this is a new timestamp
+            if (lastDexcomReadingTime != oldDexcomReadingTime) {
+              Serial.println("*** NEW READING DETECTED! ***");
+              isNewReading = true;
+            }
+          } else {
+            strncpy(timestamp, "N/A", sizeof(timestamp));
+          }
+          
+          // Calculate glucose change
+          glucose_diff = current_glucose_mgdl - previous_glucose_mgdl;
+          
+          Serial.printf("Glucose: %.0f mg/dL | Trend: %s | Change: %+0.1f | Time: %s | New Reading: %s\n",
+                      current_glucose_mgdl, trend, glucose_diff, timestamp, isNewReading ? "YES" : "NO");
+          
+          // Update our last check time to now
+          lastUpdateTime = millis();
+          
+          // Only request display update if we have new data or first run
+          if (isNewReading || 
+              lastDisplayedGlucose < 0 || 
+              strcmp(lastDisplayedTrend, trend) != 0) {
+            displayNeedsFullUpdate = true;
+          }
+        } else {
+          Serial.println("Not enough glucose data received.");
+          
+          // Only show errors for regular checks, not for overdue checks
+          if (!isOverdueCheck) {
+            tft.fillScreen(TFT_BLACK);
+            tft.setCursor(20, 60);
+            tft.println("Not enough glucose data");
+            tft.setCursor(20, 90);
+            tft.println("Readings available: " + String(doc.size()));
+          }
+        }
+      } else {
+        Serial.print("JSON parsing error: ");
+        Serial.println(error.c_str());
+        
+        // Only show errors for regular checks, not for overdue checks
+        if (!isOverdueCheck) {
+          tft.fillScreen(TFT_BLACK);
+          tft.setCursor(20, 60);
+          tft.println("JSON Error");
+          tft.setCursor(20, 90);
+          tft.setTextSize(1);
+          tft.println(error.c_str());
+          tft.setCursor(20, 110);
+          tft.println("Raw: " + response.substring(0, 60) + "...");
+        }
+      }
+    } else if (httpResponseCode == 401) {
+      // Session expired, get a new one next time
+      Serial.println("Session expired");
+      sessionId[0] = '\0';
+      accountId[0] = '\0';
+      
+      // Only show session expired messages for regular checks
+      if (!isOverdueCheck) {
+        tft.fillScreen(TFT_BLACK);
+        tft.setCursor(20, 60);
+        tft.println("Session expired, retrying...");
+      }
+      
+      // Try to re-authenticate
+      if (authenticateWithRetry()) {  // Use retry function here too
+        if (loginToDexcom()) {
+          // Retry fetching data
+          fetchGlucoseData(isOverdueCheck);
+        }
+      }
+    } else {
+      Serial.print("Error on glucose request: ");
+      Serial.println(httpResponseCode);
+      Serial.print("Error message: ");
+      Serial.println(http.errorToString(httpResponseCode));
+      
+      // Only show errors for regular checks, not for overdue checks
+      if (!isOverdueCheck) {
+        tft.fillScreen(TFT_BLACK);
+        tft.setCursor(20, 60);
+        tft.println("Glucose Error: " + String(httpResponseCode));
+        tft.setCursor(20, 90);
+        tft.setTextSize(1);
+        tft.println("Response: " + http.getString().substring(0, 60));
+      }
+    }
+    
+    http.end();
+  }
+}
+
+// Function to extract and format timestamp from Dexcom's format
+bool formatTimestamp(const char* rawTime, char* formattedTime, size_t maxSize) {
+  if (maxSize < 6) {
+    return false; // Buffer too small
+  }
+  
+  if (strncmp(rawTime, "Date(", 5) == 0) {
+    const char* startPos = rawTime + 5;
+    const char* dashPos = strchr(startPos, '-');
+    if (dashPos == NULL) {
+      dashPos = strchr(startPos, '+'); // Try with + for positive timezone
+    }
+    
+    if (dashPos && dashPos > startPos) {
+      const char* endPos = strchr(dashPos, ')');
+      
+      if (endPos && endPos > dashPos) {
+        // Extract timestamp part
+        char timestampStr[24]; // Increased for safety
+        size_t timestampLen = dashPos - startPos;
+        if (timestampLen >= sizeof(timestampStr)) {
+          timestampLen = sizeof(timestampStr) - 1;
+        }
+        strncpy(timestampStr, startPos, timestampLen);
+        timestampStr[timestampLen] = '\0';
+        
+        Serial.print("Raw timestamp string: ");
+        Serial.println(timestampStr);
+        
+        // Extract timezone offset part
+        char tzOffsetStr[8]; // Increased for safety
+        size_t tzOffsetLen = endPos - dashPos - 1;
+        if (tzOffsetLen >= sizeof(tzOffsetStr)) {
+          tzOffsetLen = sizeof(tzOffsetStr) - 1;
+        }
+        strncpy(tzOffsetStr, dashPos + 1, tzOffsetLen);
+        tzOffsetStr[tzOffsetLen] = '\0';
+        
+        Serial.print("Timezone offset: ");
+        Serial.println(tzOffsetStr);
+        
+        // Convert timestamp to unsigned long long
+        unsigned long long timestamp;
+        char* endptr;
+        timestamp = strtoull(timestampStr, &endptr, 10);
+        
+        if (*endptr != '\0') {
+          Serial.println("Error parsing timestamp - invalid number format");
+          return false;
+        }
+        
+        // Save this timestamp for synchronization - this is the Dexcom server timestamp of the reading
+        lastDexcomReadingTime = timestamp;
+        
+        Serial.print("Parsed Dexcom timestamp (ms since epoch): ");
+        Serial.println(timestamp);
+        
+        // Debug output of the parsed timestamp
+        int tzOffset = atoi(tzOffsetStr);
+        int tzHours = tzOffset / 100;
+        int tzMinutes = tzOffset % 100;
+        
+        time_t seconds = timestamp / 1000;
+        seconds -= (tzHours * 3600 + tzMinutes * 60);
+        struct tm timeInfo;
+        gmtime_r(&seconds, &timeInfo);
+        
+        // Format for debug output
+        char debug_time[30];
+        strftime(debug_time, sizeof(debug_time), "%Y-%m-%d %H:%M:%S", &timeInfo);
+        Serial.print("Formatted time: ");
+        Serial.println(debug_time);
+        
+        // Set formatted time for display
+        snprintf(formattedTime, maxSize, "%02d:%02d", timeInfo.tm_hour, timeInfo.tm_min);
+        return true;
+      }
+    }
+  }
+  
+  Serial.println("Failed to parse timestamp format");
+  strncpy(formattedTime, "N/A", maxSize - 1);
+  formattedTime[maxSize - 1] = '\0';
+  return false;
+}
+
+// Function to update the time display at the bottom of the screen
+void updateTimeDisplay() {
+  char timeAgoStr[30];
+  int timeSize = 2;
+  int statusY = tft.height() - 30;
+  
+  // Calculate time since last reading - handle potential time sync issues
+  if (lastDexcomReadingTime > 1000000) { // Valid timestamp (after 1970)
+    // Get current time since epoch in milliseconds
+    time_t now = time(nullptr);
+    unsigned long long currentEpochMillis = ((unsigned long long)now) * 1000; // Cast to ensure proper calculation
+    
+    // Debug the actual timestamps
+    Serial.print("Current time (ms): ");
+    Serial.print(currentEpochMillis);
+    Serial.print(", Dexcom time (ms): ");
+    Serial.println(lastDexcomReadingTime);
+    
+    unsigned long minutesAgo = 0;
+    
+    // Check if our current time is reasonably close to the Dexcom time
+    if (currentEpochMillis > lastDexcomReadingTime) {
+      // Normal case - Dexcom reading is in the past
+      unsigned long timeDiff = currentEpochMillis - lastDexcomReadingTime;
+      minutesAgo = timeDiff / 60000;
+      
+      Serial.print("Reading is from the past: ");
+      Serial.print(minutesAgo);
+      Serial.println(" minutes ago");
+    } else {
+      // Clock issue - current time is before Dexcom reading (shouldn't happen, but handle gracefully)
+      unsigned long timeDiff = lastDexcomReadingTime - currentEpochMillis;
+      Serial.print("WARNING: Reading appears to be from the future by ");
+      Serial.print(timeDiff / 60000);
+      Serial.println(" minutes");
+      
+      // In this case, use the local lastUpdateTime instead
+      timeDiff = millis() - lastUpdateTime;
+      minutesAgo = timeDiff / 60000;
+      
+      Serial.print("Using local time instead: last updated ");
+      Serial.print(minutesAgo);
+      Serial.println(" minutes ago");
+    }
+    
+    // Display appropriate message based on minutes ago
+    if (minutesAgo == 0) {
+      strcpy(timeAgoStr, "Just now");
+    } else if (minutesAgo == 1) {
+      strcpy(timeAgoStr, "1 min ago");
+    } else if (minutesAgo < 60) {
+      snprintf(timeAgoStr, sizeof(timeAgoStr), "%lu mins ago", minutesAgo);
+    } else if (minutesAgo < 24 * 60) { // Less than 24 hours
+      unsigned long hoursAgo = minutesAgo / 60;
+      if (hoursAgo == 1) {
+        snprintf(timeAgoStr, sizeof(timeAgoStr), "1 hour ago");
+      } else {
+        snprintf(timeAgoStr, sizeof(timeAgoStr), "%lu hours ago", hoursAgo);
+      }
+    } else if (minutesAgo < 7 * 24 * 60) { // Less than a week
+      unsigned long daysAgo = minutesAgo / (24 * 60);
+      snprintf(timeAgoStr, sizeof(timeAgoStr), "%lu days ago", daysAgo);
+    } else {
+      // Over a week old - just display the timestamp
+      struct tm timeInfo;
+      time_t seconds = lastDexcomReadingTime / 1000;
+      gmtime_r(&seconds, &timeInfo);
+      strftime(timeAgoStr, sizeof(timeAgoStr), "%m-%d %H:%M", &timeInfo);
+    }
+  } else {
+    // Fall back to showing when we last checked
+    unsigned long elapsedMillis = millis() - lastUpdateTime;
+    unsigned long minutesAgo = elapsedMillis / 60000;
+    
+    if (lastUpdateTime == 0) {
+      strcpy(timeAgoStr, "No data yet");
+    } else if (minutesAgo == 0) {
+      strcpy(timeAgoStr, "Updated just now");
+    } else if (minutesAgo == 1) {
+      strcpy(timeAgoStr, "Updated 1 min ago");
+    } else if (minutesAgo < 60) {
+      snprintf(timeAgoStr, sizeof(timeAgoStr), "Updated %lu mins ago", minutesAgo);
+    } else {
+      unsigned long hoursAgo = minutesAgo / 60;
+      if (hoursAgo == 1) {
+        snprintf(timeAgoStr, sizeof(timeAgoStr), "Updated 1 hr ago");
+      } else {
+        snprintf(timeAgoStr, sizeof(timeAgoStr), "Updated %lu hrs ago", hoursAgo);
+      }
+    }
+  }
+  
+  // Update if the time string has changed or is empty (after a full screen refresh)
+  if (strcmp(lastDisplayedTimeStr, timeAgoStr) != 0 || lastDisplayedTimeStr[0] == '\0') {
+    // Only do a small area erase rather than full screen clear
+    tft.fillRect(0, statusY - 5, tft.width(), 35, TFT_BLACK);
+    
+    // Calculate text position to center
+    int timeWidth = strlen(timeAgoStr) * 6 * timeSize;
+    int timeX = (tft.width() - timeWidth) / 2;
+    
+    // Display the time ago string centered at the bottom
+    tft.setTextSize(timeSize);
+    tft.setTextColor(TFT_WHITE);
+    tft.setCursor(timeX, statusY);
+    tft.print(timeAgoStr);
+    
+    // Save the displayed time string to compare next time
+    strncpy(lastDisplayedTimeStr, timeAgoStr, sizeof(lastDisplayedTimeStr) - 1);
+    lastDisplayedTimeStr[sizeof(lastDisplayedTimeStr) - 1] = '\0'; // Ensure null termination
+  }
+}
+
+void updateDisplay() {
+  // Only perform a full refresh if something has actually changed
+  bool glucoseChanged = (lastDisplayedGlucose != current_glucose_mgdl);
+  bool trendChanged = (strcmp(lastDisplayedTrend, trend) != 0);
+  bool unitsChanged = (lastDisplayedMgDL != displayMgDL);
+  
+  if (!glucoseChanged && !trendChanged && !unitsChanged && !displayNeedsFullUpdate) {
+    // Nothing changed, no need to update
+    return;
+  }
+  
+  // Save current values for next comparison
+  lastDisplayedGlucose = current_glucose_mgdl;
+  strncpy(lastDisplayedTrend, trend, sizeof(lastDisplayedTrend) - 1);
+  lastDisplayedTrend[sizeof(lastDisplayedTrend) - 1] = '\0'; // Ensure null termination
+  lastDisplayedMgDL = displayMgDL;
+  
+  // Clear the screen for a full update
+  tft.fillScreen(TFT_BLACK);
+
+  // Format glucose value as string to calculate width
+  char glucoseStr[10];
+  
+  // Determine which value to display based on display mode
+  if (displayMgDL) {
+    // Show mg/dL reading
+    sprintf(glucoseStr, "%.0f", current_glucose_mgdl);
+  } else {
+    // Show mmol/L reading
+    sprintf(glucoseStr, "%.1f", glucose_mmol);
+  }
+  
+  int numDigits = strlen(glucoseStr);
+  
+  // Determine color based on glucose level
+  uint16_t colorBasedOnGlucose;
+  if (current_glucose_mgdl > 180) {
+    colorBasedOnGlucose = COLOR_BG_HIGH;
+  } else if (current_glucose_mgdl < 70) {
+    colorBasedOnGlucose = COLOR_BG_LOW;
+  } else {
+    colorBasedOnGlucose = COLOR_BG_NORMAL;
+  }
+  
+  // Pre-calculate sizes and positions for better layout
+  const int displayWidth = tft.width();   // Get full display width
+  const int displayHeight = tft.height(); // Get full display height
+  
+  // Main glucose reading - large and prominent
+  const int glucoseSize = 8;  // Size for main glucose value
+  
+  // Calculate sizes for display elements
+  const int charWidth = 6 * glucoseSize;           // Width per character
+  int glucoseWidth = numDigits * charWidth;        // Total glucose width
+  
+  // Calculate vertical centering - now just need space for glucose and arrow
+  const int glucoseHeight = glucoseSize * 8; // Approximate height of glucose display
+  const int spaceBetween = 50; // Increased space between glucose and arrow
+  const int arrowHeight = 32;  // Approximate height for arrow
+  const int totalContentHeight = glucoseHeight + spaceBetween + arrowHeight;
+  
+  // Start Y position to center the content vertically
+  // Leaving space at bottom for time display (approx 40 pixels)
+  int startY = (displayHeight - totalContentHeight - 40) / 2;
+  
+  // Positions for each element
+  int glucoseY = startY;
+  int arrowY = startY + glucoseHeight + spaceBetween; // Lowered the arrow position
+  
+  // Center horizontally with no offset
+  int glucoseX = (displayWidth - glucoseWidth) / 2;
+  
+  // Store the glucose area coordinates for touch detection
+  glucoseTouchX = glucoseX;
+  glucoseTouchY = glucoseY;
+  glucoseTouchWidth = glucoseWidth;
+  glucoseTouchHeight = glucoseHeight;
+  
+  // Display the glucose value
+  tft.setTextSize(glucoseSize);
+  tft.setTextColor(colorBasedOnGlucose);
+  tft.setCursor(glucoseX, glucoseY);
+  tft.print(glucoseStr);
+  
+  // Units - to the right of glucose
+  int unitsSize = 2;
+  tft.setTextSize(unitsSize);
+  tft.setTextColor(TFT_WHITE);
+  
+  // Calculate position for units - need more space for mmol/L
+  int unitsOffset = 10;
+  int unitsX;
+  
+  if (displayMgDL) {
+    // mg/dL is shorter, use normal position
+    unitsX = glucoseX + glucoseWidth + unitsOffset;
+  } else {
+    // mmol/L is longer, make sure it fits on screen
+    int mmolTextWidth = 6 * unitsSize * 6; // "mmol/L" is about 6 chars, each 6 pixels wide at size 2
+    int maxUnitsX = displayWidth - mmolTextWidth - 5; // Keep 5 pixels margin from right edge
+    unitsX = min(glucoseX + glucoseWidth + unitsOffset, maxUnitsX);
+  }
+  
+  tft.setCursor(unitsX, glucoseY + 20);
+  
+  // Show appropriate units
+  if (displayMgDL) {
+    tft.print("mg/dL");
+  } else {
+    tft.print("mmol/L");
+  }
+  
+  // Glucose Change Indicator
+  tft.setTextSize(2);
+  tft.setCursor(glucoseX + glucoseWidth + 10, glucoseY);
+  
+  if (glucose_diff > 0) {
+    tft.setTextColor(TFT_GREEN);
+    tft.printf("+%.0f", glucose_diff);
+  } else if (glucose_diff < 0) {
+    tft.setTextColor(TFT_RED);
+    tft.printf("%.0f", glucose_diff);
+  } else {
+    tft.setTextColor(TFT_WHITE);
+    tft.print("+0");
+  }
+  
+  // Trend Arrow
+  int trendIndex = -1;
+  for (int i = 0; i < 10; i++) {
+    if (strcmp(trend, DEXCOM_TREND_DIRECTIONS[i]) == 0) {
+      trendIndex = i;
+      break;
+    }
+  }
+  
+  // Position arrow - centered horizontally
+  int arrowX = displayWidth / 2;
+  
+  // Log the trend we're about to display
+  Serial.print("Current trend direction: ");
+  Serial.println(trend);
+  
+  // Draw the trend indicator
+  drawTrendIndicator(arrowX, arrowY, trend, colorBasedOnGlucose);
+  
+  // Display time since last reading at the bottom - force update even if the string hasn't changed
+  // We want to make sure the time is always displayed after a full screen refresh
+  // Reset the lastDisplayedTimeStr to force a redraw of the time
+  lastDisplayedTimeStr[0] = '\0';  
+  updateTimeDisplay();
+}
+
+// Initialize SPIFFS for storing settings
+bool initSPIFFS() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS initialization failed!");
+    return false;
+  }
+  Serial.println("SPIFFS initialized");
+  return true;
+}
+
+// Save settings to SPIFFS
+void saveSettings() {
+  File file = SPIFFS.open("/settings.json", FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to open settings file for writing");
+    return;
+  }
+  
+  // Debug output
+  Serial.println("Saving settings:");
+  Serial.print("Username (length): ");
+  Serial.println(strlen(settings.dexcomUsername));
+  Serial.print("Password (length): ");
+  Serial.println(strlen(settings.dexcomPassword));
+  Serial.print("Using EU Server: ");
+  Serial.println(settings.useEUServer ? "Yes" : "No");
+  
+  DynamicJsonDocument doc(512);
+  doc["dexcomUsername"] = settings.dexcomUsername;
+  doc["dexcomPassword"] = settings.dexcomPassword;
+  doc["useEUServer"] = settings.useEUServer;
+  
+  if (serializeJson(doc, file) == 0) {
+    Serial.println("Failed to write settings to file");
+  } else {
+    Serial.println("Settings saved successfully");
+  }
+  
+  file.close();
+  
+  // Verify the file was written correctly
+  if (SPIFFS.exists("/settings.json")) {
+    File verifyFile = SPIFFS.open("/settings.json", FILE_READ);
+    if (verifyFile) {
+      String content = verifyFile.readString();
+      verifyFile.close();
+      Serial.println("Settings file content:");
+      Serial.println(content);
+    }
+  }
+}
+
+// Load settings from SPIFFS
+void loadSettings() {
+  if (!SPIFFS.exists("/settings.json")) {
+    Serial.println("Settings file not found");
+    return;
+  }
+  
+  File file = SPIFFS.open("/settings.json", FILE_READ);
+  if (!file) {
+    Serial.println("Failed to open settings file for reading");
+    return;
+  }
+  
+  DynamicJsonDocument doc(512);
+  DeserializationError error = deserializeJson(doc, file);
+  
+  if (error) {
+    Serial.println("Failed to parse settings file");
+  } else {
+    strncpy(settings.dexcomUsername, doc["dexcomUsername"] | "", sizeof(settings.dexcomUsername) - 1);
+    settings.dexcomUsername[sizeof(settings.dexcomUsername) - 1] = '\0'; // Ensure null termination
+    
+    strncpy(settings.dexcomPassword, doc["dexcomPassword"] | "", sizeof(settings.dexcomPassword) - 1);
+    settings.dexcomPassword[sizeof(settings.dexcomPassword) - 1] = '\0'; // Ensure null termination
+    
+    settings.useEUServer = doc["useEUServer"] | false;
+    
+    Serial.println("Settings loaded");
+    Serial.print("Username length: ");
+    Serial.println(strlen(settings.dexcomUsername));
+    Serial.print("Password length: ");
+    Serial.println(strlen(settings.dexcomPassword));
+  }
+  
+  file.close();
+}
+
+// Display initial screen
+void displayInitialScreen() {
+  tft.setTextSize(2);
+  tft.setCursor(20, 30);
+  tft.println("Dexcom Glucose Monitor");
+  tft.setCursor(20, 60);
+  tft.println("Starting up...");
+}
+
+// Callback function when entering WiFiManager config mode
+void configModeCallback(WiFiManager *myWiFiManager) {
+  Serial.println("Entered config mode");
+  
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(20, 30);
+  tft.println("WiFi Setup Mode");
+  tft.setCursor(20, 60);
+  tft.println("Connect to WiFi network:");
+  tft.setCursor(20, 90);
+  tft.println("Dexcom-Monitor-Setup");
+  tft.setCursor(20, 120);
+  tft.println("Then open in browser:");
+  tft.setCursor(20, 150);
+  tft.println("192.168.4.1");
+}
+
+// WiFi connection check function
+void checkWiFiConnection() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection is down, reconnecting...");
+    
+    // Show on display
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(TFT_RED);
+    tft.setCursor(40, 60);
+    tft.println("WiFi Down...");
+    tft.setCursor(40, 90);
+    tft.println("Reconnecting...");
+    
+    // Try to reconnect
+    WiFi.disconnect();
+    WiFi.reconnect();
+    
+    unsigned long startAttemptTime = millis();
+    
+    // Try reconnecting for 30 seconds
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 30000) {
+      delay(1000);
+      Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nReconnected to WiFi");
+      
+      // Show success on display
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextColor(TFT_GREEN);
+      tft.setCursor(40, 60);
+      tft.println("WiFi Connected");
+      delay(2000); // Keep message visible before updating
+      
+      // Mark display for update after reconnection
+      displayNeedsFullUpdate = true;
+    } else {
+      Serial.println("\nWiFi reconnection failed");
+      
+      // Keep showing disconnected status
+      tft.setTextColor(TFT_RED);
+      tft.setCursor(40, 120);
+      tft.println("Still disconnected");
+      tft.setCursor(40, 150);
+      tft.println("Will retry soon...");
+    }
+  }
+}
